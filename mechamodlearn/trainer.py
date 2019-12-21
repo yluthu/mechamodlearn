@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
-from mechamodlearn import dataset, logger, nested, transform, utils
+from mechamodlearn import dataset, logger, nested, transform, utils, rigidbody
 from mechamodlearn.metric_tracker import MetricTracker
 from mechamodlearn.odesolver import ActuatedODEWrapper, odeint
 
@@ -469,7 +469,141 @@ class OfflineTrainer(TrainerBase):
             **v_ts_error,
         }
         return metrics
+    
+    
+class SimpleDeLaNTrainer(TrainerBase):
+    
+    def __init__(
+        self,
+        model: rigidbody.DeLaN,
+        gt_model: rigidbody.AbstractRigidBody,
+        optimizer: torch.optim.Optimizer,
+        train_datagen,
+        valid_batch,
+        num_train_batches: int = 1000,
+        batch_size: int = 256,
+        logdir: Optional[str] = None,
+        summary_interval: int = 10,
+        ckpt_interval: int = 50,
+        should_log_parameter_statistics: bool = False,
+        device='cpu',
+    ):
+        metric_tracker = MetricTracker()    # not used
+        super().__init__(model, optimizer, logdir, metric_tracker)
+        
+        self._gt_model = gt_model
+        self._train_datagen = train_datagen
+        self._valid_batch = valid_batch
+        self._num_train_batches = num_train_batches
+        self._batch_size = batch_size
+        self._summary_interval = summary_interval
+        self._ckpt_interval = ckpt_interval
+        self._should_log_parameter_statistics = should_log_parameter_statistics
+        self._device = device
+        self.model.to(device=self._device)
+        
+    def train(self):
+        logger.info("Begin training...")
+        
+        metrics = {}
+        
+        for batch_i in tqdm.tqdm(range(self._num_train_batches)):
+            train_metrics = self._train_batch(batch_i)
+            valid_metrics = self._validation()
+            
+            for k, v in train_metrics.items():
+                logger.logkv("training/{}".format(k), v)
 
+            for k, v in valid_metrics.items():
+                logger.logkv("validation/{}".format(k), v)
+                
+            # checkpoint
+            if self._logdir:
+                if (batch_i % self._ckpt_interval == 0) or (
+                        batch_i + 1) == self._num_train_batches:
+                    self._save_checkpoint(batch_i)
+                    
+            # write statistics
+            if (batch_i % self._summary_interval == 0) or (
+                    batch_i + 1) == self._num_train_batches:
+                if self._should_log_parameter_statistics:
+                    self._parameter_and_gradient_statistics()
+
+                train_metrics = self._metrics(self._last_train_batch)
+                for k, v in train_metrics.items():
+                    logger.logkv("training/{}".format(k), v)
+
+                val_metrics = self._metrics(self._valid_batch, log_sample_MM_spectrum=3)
+                for k, v in val_metrics.items():
+                    logger.logkv("validation/{}".format(k), v)
+                
+            logger.dumpkvs()
+            
+        return metrics
+    
+    def _train_batch(self, batch_i: int) -> Dict[str, float]:
+        logger.info("Training batch {}/{}".format(batch_i, self._num_train_batches - 1))
+        
+        self._last_train_batch = next(self._train_datagen)
+        self.optimizer.zero_grad()
+        q_b, v_b, qddot_b, F_b = map(lambda b: b.to(self._device), self._last_train_batch)
+        loss, loss_vec = compute_DeLaNloss(self.model, q_b, v_b, qddot_b, F_b)
+        loss.backward()
+        self.optimizer.step()
+        
+        metrics = {}
+        metrics['loss_F_tot'] = loss.cpu().detach().item()
+        for i in range(self.model._qdim):
+            metrics[f'loss_F_{i}'] = loss_vec[i].cpu().detach().item()
+        
+        return metrics
+    
+    def _validation(self) -> Dict[str, float]:
+        logger.info("Validating")
+        q_b, v_b, qddot_b, F_b = map(lambda b: b.to(self._device), self._valid_batch)
+        with torch.no_grad():
+            loss, loss_vec = compute_DeLaNloss(self.model, q_b, v_b, qddot_b, F_b)
+            
+        metrics = {}
+        metrics['loss_F'] = loss.cpu().detach().item()
+        for i in range(self.model._qdim):
+            metrics[f'loss_F_{i}'] = loss_vec[i].cpu().detach().item()
+        
+        return metrics
+    
+    def _metrics(self, data, log_sample_MM_spectrum=0) -> Dict[str, float]:
+        metrics = {}
+        q_b, v_b, qddot_b, F_b = data
+        q_b_d, v_b_d, qddot_b_d, F_b_d = map(lambda b: b.to(self._device), data)
+        with torch.no_grad():
+            # MSE of qddot
+            F_pred = self.model(q_b_d, v_b_d, qddot_b_d)
+            qddot_pred = self._gt_model.solve_euler_lagrange_from_F(q_b, v_b, F_pred.cpu()).to(self._device)
+            # mean over batch, preserve coordinates
+            loss_qddot = F.mse_loss(
+                qddot_b_d,
+                qddot_pred,
+                reduction='none'
+            ).mean(0)
+            for i in range(self.model._qdim):
+                metrics[f'loss_qddot_{i}'] = loss_qddot[i].cpu().detach().item()
+                
+            # MSE of spectrum of mass matrix
+            MM_gt = self._gt_model.mass_matrix(q_b)
+            spectrum_gt, _ = torch.symeig(MM_gt, eigenvectors=False)
+            MM_pred = self.model.mass_matrix(q_b_d).cpu()
+            spectrum_pred, _ = torch.symeig(MM_pred, eigenvectors=False)
+            loss_spectrum = F.mse_loss(spectrum_gt, spectrum_pred)
+            metrics['loss_spectrum'] = loss_spectrum.detach().item()
+            
+            # Min and Max predicted eigenvalue for the first `log_sample_MM_spectrum` samples
+            for i in range(log_sample_MM_spectrum):
+                eig_min, eig_max = spectrum_pred[i][0].detach().item(), spectrum_pred[i][-1].detach().item()
+                metrics[f'eig_min_{i}'] = eig_min
+                metrics[f'eig_max_{i}'] = eig_max
+        return metrics
+                
+            
 
 def compute_qvloss(model, q_T_B, v_T_B, u_T_B, dt, vlambda=1.0, method='rk4', preds=False):
     """Computes T-step loss
@@ -514,6 +648,13 @@ def compute_qvloss(model, q_T_B, v_T_B, u_T_B, dt, vlambda=1.0, method='rk4', pr
 
     return loss, info
 
+
+def compute_DeLaNloss(model, q_b, v_b, qddot_b, F_b):
+    F_pred = model(q_b, v_b, qddot_b)
+    # mean over batch
+    loss_vec = F.mse_loss(F_pred, F_b, reduction='none').mean(0)
+    loss = loss_vec.sum()
+    return loss, loss_vec
 
 def move_optimizer_to_gpu(optimizer):
     """

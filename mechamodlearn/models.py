@@ -31,7 +31,7 @@ class CholeskyMMNet(torch.nn.Module):
             embed = SharedMMVEmbed(qdim, hidden_sizes)
 
         self.embed = embed
-        self.out = torch.nn.Linear(hidden_sizes[-1], int(qdim * (qdim + 1) / 2))
+        self.out = torch.nn.Linear(self.embed._hidden_sizes[-1], int(qdim * (qdim + 1) / 2))
 
     def forward(self, q):
         B = q.size(0)
@@ -50,6 +50,38 @@ class CholeskyMMNet(torch.nn.Module):
             M = self._pos_enforce((self.out(self.embed(q)) + self._bias).unsqueeze(1))
 
         return M
+    
+    
+class SymmetricMMNet(torch.nn.Module):
+
+    def __init__(self, qdim, embed=None, hidden_sizes=None):
+        self._qdim = qdim
+        super().__init__()
+        if embed is None:
+            if hidden_sizes is None:
+                raise ValueError("embed and hidden_sizes; both can't be None")
+            embed = SharedMMVEmbed(qdim, hidden_sizes)
+
+        self.embed = embed
+        self.out = torch.nn.Linear(self.embed._hidden_sizes[-1], int(qdim * (qdim + 1) / 2))
+
+    def forward(self, q):
+        B = q.size(0)
+        if self._qdim > 1:
+            L_params = self.out(self.embed(q))
+
+            L_diag = L_params[:, :self._qdim]
+            L_tril = L_params[:, self._qdim:]
+            L = q.new_zeros(B, self._qdim, self._qdim)
+            L = utils.bfill_lowertriangle(L, L_tril)
+            L = utils.bfill_diagonal(L, L_diag)
+            M = (L + L.transpose(-2, -1)) / 2
+
+        else:
+            M = self.out(self.embed(q)).unsqueeze(1)
+
+        return M
+
 
 
 class PotentialNet(torch.nn.Module):
@@ -64,12 +96,30 @@ class PotentialNet(torch.nn.Module):
             embed = SharedMMVEmbed(qdim, hidden_sizes)
 
         self.embed = embed
-        self.out = torch.nn.Linear(hidden_sizes[-1], 1)
+        self.out = torch.nn.Linear(self.embed._hidden_sizes[-1], 1)
 
     def forward(self, q):
         return self.out(self.embed(q))
 
+    
+class GradPotentialNet(torch.nn.Module):
 
+    def __init__(self, qdim, embed=None, hidden_sizes=None):
+        self._qdim = qdim
+        super().__init__()
+        if embed is None:
+            if hidden_sizes is None:
+                raise ValueError("embed and hidden_sizes; both can't be None")
+
+            embed = SharedMMVEmbed(qdim, hidden_sizes)
+
+        self.embed = embed
+        self.out = torch.nn.Linear(self.embed._hidden_sizes[-1], qdim)
+
+    def forward(self, q):
+        return self.out(self.embed(q))
+
+    
 class GeneralizedForceNet(torch.nn.Module):
 
     def __init__(self, qdim, udim, hidden_sizes):

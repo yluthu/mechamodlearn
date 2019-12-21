@@ -23,7 +23,9 @@ class SimplePendulumMM(torch.nn.Module):
         self._l = l
 
     def forward(self, q):
-        return self._l * torch.ones_like(q).unsqueeze(2) + 0. * q.unsqueeze(2)
+        # Note: the EoM in the original code seems wrong (missing square from length)
+        # The correct EoM is: l^2*qddot + gl*sin(q) = F
+        return torch.pow(self._l, 2) * torch.ones_like(q).unsqueeze(2) + 0. * q.unsqueeze(2)
 
 
 class SimplePendulumV(torch.nn.Module):

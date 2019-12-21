@@ -4,7 +4,8 @@ import abc
 import torch
 
 from mechamodlearn import nn, utils
-from mechamodlearn.models import CholeskyMMNet, PotentialNet, GeneralizedForceNet
+from mechamodlearn.models import CholeskyMMNet, SymmetricMMNet, PotentialNet, GeneralizedForceNet, \
+    GradPotentialNet, SharedMMVEmbed
 
 
 class AbstractRigidBody:
@@ -23,6 +24,7 @@ class AbstractRigidBody:
     @abc.abstractmethod
     def potential(self, q):
         """Return potential for configuration q"""
+        # NOTE: this actually models -V(q) instead of V(q), so G(q) can be obtained by taking the gradient.
 
     @abc.abstractmethod
     def generalized_force(self, q, v, u):
@@ -127,8 +129,37 @@ class AbstractRigidBody:
             F = self.generalized_force(q, v, u)
 
         # Solve M \qddot = F - Cv - G
-        qddot = torch.gesv(F - Cv - G.unsqueeze(2), M)[0].squeeze(2)
+        qddot = torch.solve(F - Cv - G.unsqueeze(2), M)[0].squeeze(2)
         return qddot
+    
+    def solve_euler_lagrange_from_F(self, q, v, F):
+        """Computes `qddot`, assuming the force is directly controlled."""
+        with torch.enable_grad():
+            with utils.temp_require_grad((q, v)):
+                M = self.mass_matrix(q)
+                Cv = self.corriolisforce(q, v, M)
+                G = self.gradpotential(q)
+                
+        # Solve M \qddot = F - Cv - G
+        qddot = torch.solve(F.unsqueeze(2) - Cv - G.unsqueeze(2), M)[0].squeeze(2)
+        return qddot
+    
+    def inverse_dynamics(self, q, v, qddotd, M=None, Cv=None, G=None):
+        """ Computes generalized force using
+        the Euler-Lagrange equation
+        F = M\qddot + Cv + G
+        """
+        with torch.enable_grad():
+            with utils.temp_require_grad((q, v)):
+                if M is None:
+                    M = self.mass_matrix(q)
+                if Cv is None:
+                    Cv = self.corriolisforce(q, v, M)
+                if G is None:
+                    G = self.gradpotential(q)
+
+        F = (M @ qddotd.unsqueeze(2) + Cv + G.unsqueeze(2)).squeeze(2)
+        return F
 
 
 class LearnedRigidBody(AbstractRigidBody, torch.nn.Module):
@@ -183,3 +214,57 @@ class LearnedRigidBody(AbstractRigidBody, torch.nn.Module):
 
     def forward(self, q, v, u=None):
         return self.solve_euler_lagrange(q, v, u)
+
+    
+class DeLaN(AbstractRigidBody, torch.nn.Module):
+
+    def __init__(self, qdim: int, thetamask: torch.tensor, mass_matrix_type=CholeskyMMNet,
+                 hidden_sizes=None):
+        """
+
+        Arguments:
+        - `qdim`: [int]
+        - `thetamask`: [torch.Tensor (1, qdim)] 1 if angle, 0 otherwise
+        - `mass_matrix_type`: [class]
+        - hidden_sizes: [list]
+        """
+        self._qdim = qdim
+        self._udim = qdim
+
+        self._thetamask = thetamask
+
+        super().__init__()
+        
+        embed = SharedMMVEmbed(qdim, hidden_sizes=hidden_sizes)
+        self._embed = embed
+
+        mass_matrix = mass_matrix_type(qdim, embed=self._embed)
+
+        self._mass_matrix = mass_matrix
+
+        gradpotential = GradPotentialNet(qdim, embed=self._embed)
+
+        self._gradpotential = gradpotential
+        
+        # Assume generalized force is direct input
+        self._generalized_force = lambda q, v, u: u
+
+    def mass_matrix(self, q):
+        return self._mass_matrix(q)
+
+    def gradpotential(self, q):
+        return self._gradpotential(q)
+    
+    def generalized_force(self, q, v, u):
+        return self._generalized_force(q, v, u)
+
+    @property
+    def thetamask(self):
+        return self._thetamask
+
+    def forward(self, q, v, qddotd):
+        return self.inverse_dynamics(q, v, qddotd)
+    
+    def solve_euler_lagrange(self, q, v, u=None):
+        """Should apply F directly by using solve_euler_lagrange from F."""
+        raise NotImplementedError
